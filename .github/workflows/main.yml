@@ -1,0 +1,116 @@
+name: Build EasyLoad Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+      - name: Create Android platform and enable camera
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f pubspec.yaml
+          test -d assets/provider_logos
+          test -n "$(find assets/provider_logos -type f -print -quit)"
+          grep -q '^name: easyload_shop_manager$' pubspec.yaml
+          flutter create --project-name easyload_shop_manager . --platforms=android --org com.ilyas.easyload
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          permission = '    <uses-permission android:name="android.permission.CAMERA" />\n'
+          if 'android.permission.CAMERA' not in s:
+              s = s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">', '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n' + permission)
+          p.write_text(s)
+          PY
+          rm -rf test
+      - name: Configure Android Gradle, Kotlin and SDK versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+
+          android = Path("android")
+          gradle_files = list(android.rglob("*.gradle")) + list(android.rglob("*.gradle.kts"))
+          if not gradle_files:
+              raise SystemExit("No Android Gradle files were generated")
+
+          # Update both modern plugins DSL and legacy buildscript classpaths.
+          for path in gradle_files:
+              text = path.read_text()
+              text = re.sub(
+                  r'(id\s+["\']com\.android\.application["\']\s+version\s+["\'])[0-9.]+(["\'])',
+                  r'\g<1>8.6.1\g<2>', text)
+              text = re.sub(
+                  r'(id\s+["\']com\.android\.library["\']\s+version\s+["\'])[0-9.]+(["\'])',
+                  r'\g<1>8.6.1\g<2>', text)
+              text = re.sub(
+                  r'(com\.android\.tools\.build:gradle:)[0-9.]+',
+                  r'\g<1>8.6.1', text)
+              text = re.sub(
+                  r'(id\s+["\']org\.jetbrains\.kotlin\.android["\']\s+version\s+["\'])[0-9.]+(["\'])',
+                  r'\g<1>2.0.20\g<2>', text)
+              text = re.sub(
+                  r'(ext\.kotlin_version\s*=\s*["\'])[0-9.]+(["\'])',
+                  r'\g<1>2.0.20\g<2>', text)
+              path.write_text(text)
+
+          # Ensure compile SDK 35 for cameraX 1.5+ dependencies.
+          app = android / "app" / "build.gradle"
+          text = app.read_text()
+          text, count = re.subn(
+              r'compileSdk(?:Version)?\s+flutter\.compileSdkVersion',
+              'compileSdk 35', text)
+          if count == 0 and not re.search(r'compileSdk(?:Version)?\s+35', text):
+              raise SystemExit("Could not set compileSdk 35 in android/app/build.gradle")
+          app.write_text(text)
+
+          wrapper = android / "gradle" / "wrapper" / "gradle-wrapper.properties"
+          text = wrapper.read_text()
+          text, count = re.subn(
+              r'gradle-[0-9.]+-(?:all|bin)\.zip',
+              'gradle-8.7-all.zip', text)
+          if count == 0:
+              raise SystemExit("Could not update Gradle wrapper to 8.7")
+          wrapper.write_text(text)
+
+          print("=== Android Gradle plugin declarations ===")
+          for path in gradle_files:
+              for line in path.read_text().splitlines():
+                  if "com.android.application" in line or "com.android.tools.build:gradle" in line or "org.jetbrains.kotlin.android" in line:
+                      print(f"{path}: {line.strip()}")
+          print("Configured AGP 8.6.1, Kotlin 2.0.20, compileSdk 35, Gradle 8.7")
+          PYTHON
+          echo "=== Verify generated Android versions ==="
+          grep -RInE 'com.android.application|com.android.tools.build:gradle|org.jetbrains.kotlin.android|compileSdk' android --include='*.gradle' --include='*.gradle.kts'
+          grep -n 'distributionUrl' android/gradle/wrapper/gradle-wrapper.properties
+      - name: Get dependencies
+        run: flutter pub get
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Build release APK
+        run: flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyLoad-Shop-Manager-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
